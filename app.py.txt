@@ -1,0 +1,372 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime
+import io
+
+# Configuración de la página
+st.set_page_config(page_title="Dashboard Credimóvil", layout="wide", page_icon="🚗")
+
+# --- ESTILOS CSS PARA MODO OSCURO Y TOOLTIPS ---
+st.markdown("""
+<style>
+    [data-testid="stAppViewContainer"] {
+        background-color: #0e1117;
+    }
+    [data-testid="stHeader"] {
+        background-color: #0e1117;
+    }
+    [data-testid="stSidebar"] {
+        background-color: #262730;
+    }
+    .metric-card {
+        background-color: #1f2630;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #41444b;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- 1. FUNCIÓN DE CARGA DE DATOS ---
+@st.cache_data(ttl=3600)  # Cache para mejorar rendimiento
+def load_data(uploaded_file):
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    # Intentamos leer saltando filas decorativas (Header en fila 2 -> índice 1 o 2)
+    # Ajusta 'header=2' si tus títulos están en la fila 3 del Excel
+    try:
+        df = pd.read_excel(uploaded_file, header=2)
+    except:
+        # Fallback si falla
+        df = pd.read_excel(uploaded_file, header=1)
+
+    # LIMPIEZA DE NOMBRES DE COLUMNAS (Normalizar espacios)
+    df.columns = df.columns.str.strip()
+
+    # DETECCIÓN INTELIGENTE DE COLUMNAS (Por si cambian de nombre)
+    # Mapeo: Nombre esperado -> Posibles nombres en el Excel
+    col_map = {
+        'ID': ['ID Solicitud', 'Solicitud', 'Folio'],
+        'MONTO': ['Monto a financiar', 'Monto', 'Importe'],
+        'ESTADO': ['Estado', 'Estatus'],
+        'LOTE': ['Lote', 'Agencia'],
+        'FECHA_CREACION': ['Fecha de creación', 'Fecha inicio'],
+        'FECHA_CAMBIO': ['Último cambio de estado', 'Fecha fin', 'Fecha cierre'],
+        'OPERADOR': ['Operador coloca', 'Asesor', 'Vendedor'],
+        'NOMBRE': ['Nombre', 'Cliente', 'Solicitante'],
+        'NOTAS': ['Notas', 'Comentarios']
+    }
+
+    # Función auxiliar para buscar columna
+    def get_col(key):
+        for candidate in col_map[key]:
+            if candidate in df.columns:
+                return candidate
+        return None
+
+    # Asignar nombres reales encontrados
+    c_id = get_col('ID')
+    c_monto = get_col('MONTO')
+    c_estado = get_col('ESTADO')
+    c_lote = get_col('LOTE')
+    c_creacion = get_col('FECHA_CREACION')
+    c_cambio = get_col('FECHA_CAMBIO')
+    c_operador = get_col('OPERADOR')
+    c_nombre = get_col('NOMBRE')
+    c_notas = get_col('NOTAS')
+
+    # Si faltan columnas críticas, avisar (pero no romper)
+    if not c_monto or not c_estado:
+        st.error("Error: No se encontraron las columnas de Monto o Estado en el Excel.")
+        return pd.DataFrame()
+
+    # --- LIMPIEZA DE DATOS ---
+    
+    # 1. Montos
+    if df[c_monto].dtype == 'object':
+        df[c_monto] = df[c_monto].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False)
+        df[c_monto] = pd.to_numeric(df[c_monto], errors='coerce').fillna(0)
+
+    # 2. Fechas
+    if c_creacion:
+        df[c_creacion] = pd.to_datetime(df[c_creacion], dayfirst=True, errors='coerce')
+    if c_cambio:
+        df[c_cambio] = pd.to_datetime(df[c_cambio], dayfirst=True, errors='coerce')
+
+    # 3. Cálculo de Días de Proceso (Corrección Lógica F - N)
+    # Si hay fecha de cambio, usamos esa. Si no (proceso abierto), usamos HOY.
+    if c_creacion:
+        fecha_fin_calculo = df[c_cambio].fillna(pd.Timestamp.now())
+        df['Dias_Proceso'] = (fecha_fin_calculo - df[c_creacion]).dt.days
+        df['Dias_Proceso'] = df['Dias_Proceso'].fillna(0).astype(int)
+        # Evitar negativos por errores de captura
+        df['Dias_Proceso'] = df['Dias_Proceso'].apply(lambda x: x if x >= 0 else 0)
+    else:
+        df['Dias_Proceso'] = 0
+
+    # 4. Operadores
+    if c_operador:
+        df[c_operador] = df[c_operador].fillna("Sin Asignar")
+    else:
+        df['Operador_Simulado'] = "Sin Asignar" # Fallback
+
+    # 5. Notas (Crear si no existe)
+    if not c_notas:
+        df['Notas'] = ""
+    else:
+        df['Notas'] = df[c_notas].fillna("").astype(str)
+
+    # 6. Ordenamiento de Estatus
+    orden_estatus = [
+        'Solicitud', 'Capturada', 'Mesa de control', 'Revisión análisis', 
+        'Análisis', 'Visita', 'Autorizado', 'Contrato', 
+        'Entregada', 'Rechazada', 'Cancelado'
+    ]
+    # Aseguramos que los estatus del excel estén en la lista, si no, los agregamos al final
+    estados_excel = df[c_estado].unique()
+    for e in estados_excel:
+        if e not in orden_estatus:
+            orden_estatus.append(e)
+            
+    df[c_estado] = pd.Categorical(df[c_estado], categories=orden_estatus, ordered=True)
+
+    # Estandarización de nombres de columnas para el Dashboard
+    rename_dict = {
+        c_id: 'ID Solicitud',
+        c_monto: 'Monto',
+        c_estado: 'Estado',
+        c_lote: 'Lote',
+        c_creacion: 'Fecha Creación',
+        c_operador: 'Operador',
+        c_nombre: 'Nombre'
+    }
+    df = df.rename(columns=rename_dict)
+    
+    return df
+
+# --- INTERFAZ PRINCIPAL ---
+
+st.title("🚗 Dashboard Ejecutivo - Credimóvil")
+
+# Sidebar
+with st.sidebar:
+    st.header("📂 Carga de Datos")
+    uploaded_file = st.file_uploader("Arrastra aquí tu Excel Mensual", type=["xlsx", "xls"])
+    
+    st.markdown("---")
+    st.header("🔍 Filtros")
+
+# LÓGICA PRINCIPAL
+if uploaded_file is not None:
+    # Cargar y procesar
+    df = load_data(uploaded_file)
+    
+    if not df.empty:
+        # --- FILTROS ---
+        with st.sidebar:
+            # Filtro Lotes
+            lotes_disp = sorted(df['Lote'].astype(str).unique())
+            sel_lote = st.multiselect("Lotes", lotes_disp, placeholder="Todos")
+            
+            # Filtro Asesores
+            asesores_disp = sorted(df['Operador'].astype(str).unique())
+            sel_asesor = st.multiselect("Asesores", asesores_disp, placeholder="Todos")
+            
+            # Filtro Fechas
+            min_date = df['Fecha Creación'].min()
+            max_date = df['Fecha Creación'].max()
+            date_range = st.date_input("Rango de Fechas", [min_date, max_date])
+
+        # APLICAR FILTROS
+        df_filtered = df.copy()
+        if sel_lote:
+            df_filtered = df_filtered[df_filtered['Lote'].isin(sel_lote)]
+        if sel_asesor:
+            df_filtered = df_filtered[df_filtered['Operador'].isin(sel_asesor)]
+        if len(date_range) == 2:
+            df_filtered = df_filtered[
+                (df_filtered['Fecha Creación'].dt.date >= date_range[0]) & 
+                (df_filtered['Fecha Creación'].dt.date <= date_range[1])
+            ]
+
+        # --- EDICIÓN EN VIVO (DATA EDITOR) ---
+        st.subheader("📝 Gestión Operativa (Edición en Vivo)")
+        
+        # Buscador
+        search_term = st.text_input("🔍 Buscar Cliente (Nombre o Folio)", placeholder="Escribe para filtrar la tabla...")
+        if search_term:
+            df_display = df_filtered[
+                df_filtered['Nombre'].str.contains(search_term, case=False, na=False) | 
+                df_filtered['ID Solicitud'].str.contains(search_term, case=False, na=False)
+            ]
+        else:
+            df_display = df_filtered
+
+        # Configuración del Editor
+        df_edited = st.data_editor(
+            df_display,
+            column_config={
+                "Estado": st.column_config.SelectboxColumn(
+                    "Estado",
+                    help="Cambia el estatus del trámite",
+                    width="medium",
+                    options=[
+                        'Solicitud', 'Capturada', 'Mesa de control', 'Revisión análisis', 
+                        'Análisis', 'Visita', 'Autorizado', 'Contrato', 
+                        'Entregada', 'Rechazada', 'Cancelado'
+                    ],
+                    required=True,
+                ),
+                "Monto": st.column_config.NumberColumn(
+                    "Monto ($)",
+                    format="$%d",
+                ),
+                "Dias_Proceso": st.column_config.ProgressColumn(
+                    "Días en Proceso",
+                    format="%d días",
+                    min_value=0,
+                    max_value=30,
+                ),
+            },
+            disabled=["ID Solicitud", "Fecha Creación", "Lote", "Operador", "Nombre", "Dias_Proceso"],
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed"
+        )
+
+        # --- CÁLCULOS DE KPIS (Usando df_edited) ---
+        total_solicitudes = len(df_edited)
+        monto_total = df_edited['Monto'].sum()
+        
+        # Fondeados (Solo Entregada)
+        df_fondeados = df_edited[df_edited['Estado'] == 'Entregada']
+        total_fondeado = df_fondeados['Monto'].sum()
+        conteo_fondeado = len(df_fondeados)
+        
+        # Promedio Días (General o solo entregadas)
+        promedio_dias = df_edited['Dias_Proceso'].mean()
+
+        # Mostrar KPIs
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Solicitudes", f"{total_solicitudes}", "Volumen")
+        k2.metric("Monto Total Cartera", f"${monto_total:,.0f}", "MXN")
+        k3.metric("Total Fondeado (Entregada)", f"${total_fondeado:,.0f}", f"{conteo_fondeado} créditos")
+        k4.metric("Tiempo Promedio Ciclo", f"{promedio_dias:.1f} días", "Eficiencia")
+
+        st.markdown("---")
+
+        # --- GRÁFICOS (NEÓN) ---
+        col_g1, col_g2 = st.columns([2, 1])
+
+        # G1: Barras Agrupadas (Mes y Estado)
+        df_edited['Mes'] = df_edited['Fecha Creación'].dt.strftime('%Y-%m')
+        grouped_data = df_edited.groupby(['Mes', 'Estado'])['ID Solicitud'].count().reset_index()
+        
+        fig_bar = px.bar(
+            grouped_data, 
+            x='Mes', 
+            y='ID Solicitud', 
+            color='Estado', 
+            barmode='group',
+            title='Evolución de Solicitudes por Mes y Estado',
+            color_discrete_sequence=px.colors.qualitative.Bold  # Colores vivos
+        )
+        fig_bar.update_layout(
+            plot_bgcolor='rgba(0,0,0,0)', 
+            paper_bgcolor='rgba(0,0,0,0)', 
+            font_color='white',
+            hoverlabel=dict(bgcolor="#1f2630", font_color="white", font_size=14) # Tooltip blanco
+        )
+        col_g1.plotly_chart(fig_bar, use_container_width=True)
+
+        # G2: Dona de Estatus
+        status_counts = df_edited['Estado'].value_counts().reset_index()
+        status_counts.columns = ['Estado', 'Conteo']
+        
+        fig_pie = px.pie(
+            status_counts, 
+            values='Conteo', 
+            names='Estado', 
+            title='Distribución Actual',
+            hole=0.4,
+            color_discrete_sequence=px.colors.qualitative.Bold
+        )
+        fig_pie.update_traces(textinfo='percent+label', textfont_size=14)
+        fig_pie.update_layout(
+            font_color='white',
+            hoverlabel=dict(bgcolor="#1f2630", font_color="white", font_size=14)
+        )
+        col_g2.plotly_chart(fig_pie, use_container_width=True)
+
+        # SEGUNDA FILA DE GRÁFICOS
+        col_g3, col_g4 = st.columns(2)
+
+        # G3: Ranking Asesores (Multicolor Neón)
+        asesor_perf = df_edited.groupby('Operador')['Monto'].sum().reset_index().sort_values(by='Monto', ascending=True).tail(10)
+        
+        fig_asesor = px.bar(
+            asesor_perf, 
+            y='Operador', 
+            x='Monto', 
+            orientation='h', 
+            color='Operador', # Cada uno su color
+            title='Top 10 Asesores por Monto ($)',
+            text_auto='.2s',
+            color_discrete_sequence=px.colors.qualitative.Vivid
+        )
+        fig_asesor.update_layout(
+            plot_bgcolor='rgba(0,0,0,0)', 
+            font_color='white', 
+            showlegend=False,
+            hoverlabel=dict(bgcolor="#1f2630", font_color="white", font_size=14)
+        )
+        col_g3.plotly_chart(fig_asesor, use_container_width=True)
+
+        # G4: Tiempos por Etapa
+        tiempos_etapa = df_edited.groupby('Estado')['Dias_Proceso'].mean().reset_index()
+        
+        fig_time = px.bar(
+            tiempos_etapa, 
+            x='Estado', 
+            y='Dias_Proceso', 
+            title='Días Promedio Acumulados por Etapa Actual',
+            color='Dias_Proceso',
+            color_continuous_scale='Bluered_r'
+        )
+        fig_time.update_layout(
+            plot_bgcolor='rgba(0,0,0,0)', 
+            font_color='white',
+            hoverlabel=dict(bgcolor="#1f2630", font_color="white", font_size=14)
+        )
+        col_g4.plotly_chart(fig_time, use_container_width=True)
+
+        # --- DESCARGA ---
+        st.subheader("💾 Exportar Datos Actualizados")
+        
+        # Convertir a Excel en memoria
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            df_edited.to_excel(writer, index=False, sheet_name='Reporte')
+            
+        st.download_button(
+            label="Descargar Excel con Cambios (.xlsx)",
+            data=buffer,
+            file_name="Reporte_Credimovil_Actualizado.xlsx",
+            mime="application/vnd.ms-excel"
+        )
+
+    else:
+        st.info("El archivo se cargó pero parece estar vacío o no tiene datos válidos.")
+
+else:
+    # Pantalla de Bienvenida
+    st.info("👋 ¡Bienvenido! Por favor carga tu Excel mensual en la barra lateral para comenzar.")
+    st.markdown("""
+    ### Instrucciones:
+    1. Abre la barra lateral (izquierda).
+    2. Arrastra tu archivo Excel.
+    3. Usa los filtros y edita los estatus directamente en la tabla.
+    """)

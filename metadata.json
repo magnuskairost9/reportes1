@@ -1,0 +1,5 @@
+{
+  "name": "AutoLoan Dashboard",
+  "description": "An executive dashboard for automotive loan data, featuring Excel upload capability, KPI tracking, and interactive visualizations.",
+  "requestFramePermissions": []
+}
